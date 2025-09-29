@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Pi-hole + Unbound + CoreDNS + DoH-proxy (em sessões)
-# Execução:
-#   ./install.sh                      # roda TODAS as sessões na ordem
-#   SESSOES="1,3,5" ./install.sh      # roda somente as sessões indicadas
-# =============================================================================
 set -Eeuo pipefail
 
-# ------------------------------- Sessão 0 ------------------------------------
-# Utilitários, detecção de rede, DNS temporário e menu de execução
-# -----------------------------------------------------------------------------
-
-log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
-warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
-err()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
-pause(){ read -rp "Pressione ENTER para continuar..."; }
-
-trap 'err "Falha (linha $LINENO). Verifique a última ação."' ERR
+# ===============================
+# Utilidades
+# ===============================
+log()   { echo -e "\e[1;32m[+]\e[0m $*"; }
+warn()  { echo -e "\e[1;33m[!]\e[0m $*"; }
+err()   { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
+pause() { read -rp "➡️ Pressione ENTER para continuar..."; }
 
 need_root() {
   if [[ $(id -u) -ne 0 ]]; then
@@ -27,102 +18,73 @@ need_root() {
 
 cmd_exists() { command -v "$1" &>/dev/null; }
 
-ensure_temp_dns() {
-  printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf || true
+# ===============================
+# Sessão 0 — Preparação mínima
+# ===============================
+session0_prep() {
+  log "Sessão 0: Instalando pacotes mínimos (rede e utilitários)..."
+  apt-get update -qq
+  apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null
 }
 
-sess0_pacotes_minimos() {
-  log "Sessão 0: instalando pacotes mínimos..."
-  ensure_temp_dns
-  apt-get update -qq || true
-  apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null || true
-}
+# ===============================
+# Sessão 1 — Detecção de rede (somente aviso, não muda IP)
+# ===============================
+session1_net() {
+  log "Sessão 1: Detectando rede..."
 
-detectar_rede() {
   DEF_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1 || true)
   DEF_GW=$(ip -o -4 route show to default | awk '{print $3}' | head -1 || true)
-  CIDR=$(ip -o -4 addr show dev "${DEF_IF:-}" | awk '{print $4}' | head -1 || true)
-  CUR_IP="${CIDR%%/*}"
-  PREFIX="${CIDR##*/}"
+  CUR_IP=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+  CIDR=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | head -1 || true)
 
-  if cmd_exists ipcalc && [[ -n "${CIDR:-}" ]]; then
-    SUBNET_MASK=$(ipcalc -m "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
+  if cmd_exists ipcalc; then
+    SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
   fi
   [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK="255.255.255.0"
 
-  log "Interface padrão: ${DEF_IF:-?}"
-  log "Gateway padrão:   ${DEF_GW:-?}"
-  log "IP atual:         ${CUR_IP:-?}"
-  log "Máscara:          ${SUBNET_MASK}"
+  echo
+  log "Interface: $DEF_IF"
+  log "Gateway:   $DEF_GW"
+  log "IP atual:  $CUR_IP"
+  log "Máscara:   $SUBNET_MASK"
+  echo
+  warn "⚠️ O IP da máquina deve ser FIXO para o ambiente funcionar corretamente."
+  warn "➡️ Configure manualmente um IP fixo ($CUR_IP) no seu host/VM/container."
+  pause
 }
 
-# ------------------------------- Sessão 1 ------------------------------------
-# Configurar IP Fixo
-# -----------------------------------------------------------------------------
-sess1_ip_fixo() {
-  log "Sessão 1: configuração de IP fixo (opcional)."
-  read -rp "Deseja configurar IP fixo agora? [s/N]: " ANS
-  ANS=${ANS:-N}
-  if [[ ! "$ANS" =~ ^[sS]$ ]]; then
-    log "Mantendo IP atual por DHCP: $CUR_IP"
-    return 0
-  fi
-
-  local base last_oct NEW_IP
-  base=$(echo "$CUR_IP" | awk -F. '{print $1"."$2"."$3}')
-  read -rp "Informe o último octeto do IP (ex.: 110 para ${base}.110): " last_oct
-  [[ -z "$last_oct" ]] && { err "Octeto vazio."; exit 1; }
-
-  NEW_IP="${base}.${last_oct}"
-  CUR_IP="$NEW_IP"
-
-  mkdir -p /etc/network/interfaces.d
-  local IF_FILE="/etc/network/interfaces.d/99-${DEF_IF}-static.cfg"
-  cat > "$IF_FILE" <<EOF
-auto ${DEF_IF}
-iface ${DEF_IF} inet static
-    address ${NEW_IP}
-    netmask ${SUBNET_MASK}
-    gateway ${DEF_GW}
-    dns-nameservers 1.1.1.1 8.8.8.8
-EOF
-
-  ensure_temp_dns
-  ip addr flush dev "${DEF_IF}" || true
-  ifdown "${DEF_IF}" 2>/dev/null || true
-  ifup   "${DEF_IF}" || true
-
-  log "IP fixo aplicado: $CUR_IP (${SUBNET_MASK}) via ${DEF_IF}"
+# ===============================
+# Sessão 2 — Instalação base
+# ===============================
+session2_base() {
+  log "Sessão 2: Instalando pacotes base (compiladores, libs, Python, Go, etc)..."
+  apt-get install -y curl wget git lsof bind9-dnsutils unzip tar golang \
+    iproute2 netcat-traditional pipx python3-venv >/dev/null
 }
 
-# ------------------------------- Sessão 2 ------------------------------------
-sess2_conectividade() {
-  log "Sessão 2: garantindo conectividade..."
-  ensure_temp_dns
-  apt-get update || warn "APT update falhou, usando cache local."
-}
-
-# ------------------------------- Sessão 3 ------------------------------------
-sess3_pacotes_base() {
-  log "Sessão 3: instalando pacotes base..."
-  apt-get install -y curl wget git lsof bind9-dnsutils unzip tar golang pipx python3-venv >/dev/null
-}
-
-# ------------------------------- Sessão 4 ------------------------------------
-sess4_instalar_pihole() {
-  log "Sessão 4: instalando Pi-hole..."
+# ===============================
+# Sessão 3 — Pi-hole
+# ===============================
+session3_pihole() {
+  log "Sessão 3: Instalando Pi-hole (instalação oficial interativa)..."
+  log "➡️ Durante a instalação, selecione qualquer DNS — depois ajustaremos para Unbound (127.0.0.1#5335)."
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
 
-# ------------------------------- Sessão 5 ------------------------------------
-sess5_instalar_unbound() {
-  log "Sessão 5: instalando Unbound..."
-  apt-get install -y unbound >/dev/null
+# ===============================
+# Sessão 4 — Unbound
+# ===============================
+session4_unbound() {
+  log "Sessão 4: Instalando e configurando Unbound..."
 
+  apt-get install -y unbound >/dev/null
   install -d -m 0755 /etc/unbound/unbound.conf.d
-  cat > /etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
+
+  cat >/etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
 server:
+    verbosity: 1
     interface: 127.0.0.1
     port: 5335
     do-ip4: yes
@@ -133,39 +95,51 @@ server:
     harden-dnssec-stripped: yes
     qname-minimisation: yes
     prefetch: yes
+    hide-identity: yes
+    hide-version: yes
+    edns-buffer-size: 1232
+    cache-min-ttl: 240
+    cache-max-ttl: 86400
 EOF
 
   mkdir -p /var/lib/unbound
   wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
 
-  unbound-checkconf || { err "Erro no Unbound config"; exit 1; }
-  systemctl enable --now unbound || true
+  systemctl enable --now unbound
 
-  for i in {1..30}; do nc -z 127.0.0.1 5335 && break; sleep 1; done
-  log "Teste Unbound:"
+  log "➡️ Testando Unbound (127.0.0.1#5335)..."
   dig @127.0.0.1 -p 5335 openai.com +short || true
 }
 
-# ------------------------------- Sessão 6 ------------------------------------
-sess6_configurar_pihole_unbound() {
-  log "Sessão 6: configurando Pi-hole -> Unbound"
+# ===============================
+# Sessão 5 — Pi-hole -> Unbound
+# ===============================
+session5_pihole_conf() {
+  log "Sessão 5: Ajustando Pi-hole para usar Unbound..."
   if [[ -f /etc/pihole/setupVars.conf ]]; then
     sed -i '/^PIHOLE_DNS_/d' /etc/pihole/setupVars.conf
-    echo "PIHOLE_DNS_1=127.0.0.1#5335" >> /etc/pihole/setupVars.conf
+    {
+      echo "PIHOLE_DNS_1=127.0.0.1#5335"
+      echo "PIHOLE_DNS_2="
+    } >> /etc/pihole/setupVars.conf
   fi
-  systemctl restart pihole-FTL || true
+  systemctl restart pihole-FTL
+  dig @127.0.0.1 -p 53 openai.com +short || true
 }
 
-# ------------------------------- Sessão 7 ------------------------------------
-sess7_instalar_coredns() {
-  log "Sessão 7: instalando CoreDNS..."
+# ===============================
+# Sessão 6 — CoreDNS
+# ===============================
+session6_coredns() {
+  log "Sessão 6: Instalando CoreDNS..."
   cd /opt
-  curl -fsSL -o coredns.tgz https://github.com/coredns/coredns/releases/download/v1.11.3/coredns_1.11.3_linux_amd64.tgz
+  local COREDNS_VER="1.11.3"
+  curl -fsSL -o coredns.tgz "https://github.com/coredns/coredns/releases/download/v${COREDNS_VER}/coredns_${COREDNS_VER}_linux_amd64.tgz"
   tar -xzf coredns.tgz
   install -m 0755 coredns /usr/local/bin/coredns
   mkdir -p /etc/coredns
 
-  cat > /etc/coredns/Corefile <<'EOF'
+  cat >/etc/coredns/Corefile <<'EOF'
 .:8053 {
     errors
     log
@@ -174,29 +148,38 @@ sess7_instalar_coredns() {
 }
 EOF
 
-  systemctl daemon-reload
-  cat > /etc/systemd/system/coredns.service <<'EOF'
+  cat >/etc/systemd/system/coredns.service <<'EOF'
 [Unit]
-Description=CoreDNS
-After=network.target
+Description=CoreDNS (porta 8053)
+After=network.target pihole-FTL.service unbound.service
+Requires=pihole-FTL.service unbound.service
+
 [Service]
 ExecStart=/usr/local/bin/coredns -conf /etc/coredns/Corefile
 Restart=always
+LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
+  systemctl daemon-reload
   systemctl enable --now coredns
 }
 
-# ------------------------------- Sessão 8 ------------------------------------
-sess8_instalar_doh_proxy() {
-  log "Sessão 8: instalando DoH-proxy..."
+# ===============================
+# Sessão 7 — DoH-proxy
+# ===============================
+session7_doh() {
+  log "Sessão 7: Instalando DoH-proxy..."
   pipx install doh-proxy || true
-  cat > /etc/systemd/system/doh-proxy.service <<EOF
+
+  cat >/etc/systemd/system/doh-proxy.service <<EOF
 [Unit]
-Description=DoH Proxy
-After=network.target
+Description=DoH Proxy (:8054)
+After=network.target pihole-FTL.service unbound.service
+Requires=pihole-FTL.service unbound.service
+
 [Service]
 ExecStart=/root/.local/bin/doh-httpproxy \\
   --listen-address=${CUR_IP} \\
@@ -205,48 +188,72 @@ ExecStart=/root/.local/bin/doh-httpproxy \\
   --upstream-resolver=127.0.0.1 \\
   --upstream-port=53
 Restart=on-failure
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
   systemctl enable --now doh-proxy
 }
 
-# ------------------------------- Sessão 9 ------------------------------------
-sess9_testes() {
-  log "Sessão 9: testes finais"
-  dig @127.0.0.1 -p 5335 openai.com +short || true
-  dig @127.0.0.1 -p 53 openai.com +short || true
-  dig @127.0.0.1 -p 8053 openai.com +short || true
-  curl -s "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" -H 'accept: application/dns-json' || true
+# ===============================
+# Sessão 8 — Testes finais
+# ===============================
+session8_tests() {
+  log "Sessão 8: Testes locais de validação"
+  echo "Unbound → "; dig @127.0.0.1 -p 5335 openai.com +short || true
+  echo "Pi-hole → "; dig @127.0.0.1 -p 53 openai.com +short || true
+  echo "CoreDNS → "; dig @127.0.0.1 -p 8053 openai.com +short || true
+  echo "DoH-proxy → "; curl -s -H 'accept: application/dns-json' "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
 }
 
-# ========================== Orquestrador ==========================
-run_sessions() {
-  local ORDERED=("0" "1" "2" "3" "4" "5" "6" "7" "8" "9")
-  local TO_RUN=()
-  if [[ -n "${SESSOES:-}" ]]; then
-    IFS=',' read -r -a TO_RUN <<< "$SESSOES"
+# ===============================
+# Sessão 9 — Senha Pi-hole
+# ===============================
+session9_password() {
+  read -rp "Deseja alterar a senha do painel do Pi-hole agora? [s/N]: " ANS
+  ANS=${ANS:-N}
+  if [[ "$ANS" =~ ^[sS]$ ]]; then
+    read -rp "Informe a nova senha: " NEWPASS
+    pihole setpassword "$NEWPASS"
+    log "Senha do Pi-hole alterada com sucesso."
   else
-    TO_RUN=("${ORDERED[@]}")
+    log "Mantida a senha gerada automaticamente pelo Pi-hole."
   fi
-  for s in "${TO_RUN[@]}"; do
-    case "$s" in
-      0) sess0_pacotes_minimos; detectar_rede ;;
-      1) detectar_rede; sess1_ip_fixo; detectar_rede ;;
-      2) sess2_conectividade ;;
-      3) sess3_pacotes_base ;;
-      4) sess4_instalar_pihole ;;
-      5) sess5_instalar_unbound ;;
-      6) sess6_configurar_pihole_unbound ;;
-      7) sess7_instalar_coredns ;;
-      8) sess8_instalar_doh_proxy ;;
-      9) sess9_testes ;;
-    esac
-  done
 }
 
-# ================================ MAIN =============================
+# ===============================
+# Sessão final — Instruções NPM
+# ===============================
+final_msg() {
+  echo
+  log "Instalação concluída!"
+  echo "============================================================"
+  echo " IP detectado: $CUR_IP"
+  echo
+  echo "➡️ Configure no Nginx Proxy Manager (NPM):"
+  echo "  - DoH: Proxy Host → ${CUR_IP}:8054 → /dns-query (com SSL)"
+  echo "  - DoT: Stream → ${CUR_IP}:8053 → porta 853 (com SSL)"
+  echo
+  echo "Exemplos de testes externos:"
+  echo "  kdig @dns.seudominio.com +https=/dns-query openai.com"
+  echo "  kdig @dns.seudominio.com -p 853 +tls openai.com"
+  echo "============================================================"
+}
+
+# ===============================
+# Main
+# ===============================
 need_root
-run_sessions
-log "Instalação concluída!"
+session0_prep
+session1_net
+session2_base
+session3_pihole
+session4_unbound
+session5_pihole_conf
+session6_coredns
+session7_doh
+session8_tests
+session9_password
+final_msg
