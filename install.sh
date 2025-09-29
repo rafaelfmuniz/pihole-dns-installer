@@ -16,8 +16,9 @@ need_root() {
 
 cmd_exists() { command -v "$1" &>/dev/null; }
 
-# ===== pacotes mínimos para detectar rede =====
+# ===== pacotes mínimos =====
 install_nettools() {
+  log "Instalando pacotes básicos de rede (iproute2, net-tools, ipcalc)..."
   apt-get update -qq
   apt-get install -y iproute2 net-tools ipcalc >/dev/null
 }
@@ -32,8 +33,7 @@ detect_net() {
   if cmd_exists ipcalc; then
     SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
   fi
-  [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f2 | head -1)
-  [[ -n "$SUBNET_MASK" && "$SUBNET_MASK" =~ ^[0-9]+$ ]] && SUBNET_MASK=$(ipcalc "$CUR_IP/$SUBNET_MASK" | awk -F= '/NETMASK/{print $2}')
+  [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK="255.255.255.0"
 
   log "Interface padrão: $DEF_IF"
   log "Gateway padrão:   $DEF_GW"
@@ -46,7 +46,7 @@ detect_net() {
   fi
 }
 
-# ===== IP fixo =====
+# ===== escolha de IP fixo =====
 choose_static_ip() {
   echo
   log "Recomendação: usar IP FIXO (a instalação irá referenciar este IP)."
@@ -61,24 +61,17 @@ choose_static_ip() {
     read -rp "Confirme o IP fixo desejado [$NEW_IP] (ENTER para aceitar): " CONF
     [[ -n "${CONF:-}" ]] && NEW_IP="$CONF"
 
-    read -rp "Informe o(s) DNS local(is) a publicar (ex.: deixe vazio para usar padrão): " PUBL_DNS || true
-    if [[ -z "${PUBL_DNS:-}" ]]; then
-      PUBL_DNS="1.1.1.1 8.8.8.8"
-      log "Nenhum DNS informado. Usando padrão: $PUBL_DNS"
-    fi
+    read -rp "Informe o(s) DNS local(is) a publicar (ENTER para padrão): " PUBL_DNS || true
+    [[ -z "${PUBL_DNS:-}" ]] && PUBL_DNS="1.1.1.1 8.8.8.8"
 
     if cmd_exists nmcli; then
       log "NetworkManager detectado. Ajustando IP fixo via nmcli..."
       CONN=$(nmcli -t -f NAME con show --active | head -1)
-      if [[ -z "$CONN" ]]; then
-        err "Não encontrei conexão ativa no NM. Ajuste manualmente ou use ifupdown."
-      else
-        nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW" ipv4.dns "$PUBL_DNS"
-        nmcli con down "$CONN" || true
-        nmcli con up "$CONN"
-        CUR_IP="$NEW_IP"
-        log "IP fixo aplicado via NetworkManager: $CUR_IP"
-      fi
+      nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW" ipv4.dns "$PUBL_DNS"
+      nmcli con down "$CONN" || true
+      nmcli con up "$CONN"
+      CUR_IP="$NEW_IP"
+      log "IP fixo aplicado via NetworkManager: $CUR_IP"
     elif [[ -f /etc/network/interfaces ]]; then
       log "ifupdown detectado. Vou preparar bloco estático para $DEF_IF."
       INTERF=/etc/network/interfaces
@@ -101,12 +94,21 @@ EOF
       log "IP fixo aplicado via ifupdown: $CUR_IP"
     else
       warn "Nem NetworkManager nem ifupdown detectados. Pulei ajuste automático."
-      warn "Se necessário, fixe IP manualmente e rode o script de novo."
     fi
   else
     log "Mantendo IP atual (DHCP): $CUR_IP"
   fi
 }
+
+# ===== resto das funções (Pi-hole, Unbound, CoreDNS, DoH-proxy, testes, etc.) =====
+# Mantém tudo igual à sua versão que já funcionava
+
+# ===== main =====
+need_root
+install_nettools     # <-- ipcalc instalado ANTES de detect_net
+detect_net
+choose_static_ip
+# aqui depois seguem: install_base, install_pihole, install_unbound, configure_pihole_upstream, install_coredns, install_doh_proxy, final_tests, print_npm_instructions
 
 # ===== pacotes base =====
 install_base() {
