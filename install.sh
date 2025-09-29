@@ -9,6 +9,20 @@ warn()  { echo -e "\e[1;33m[!]\e[0m $*"; }
 err()   { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
 pause() { read -rp "➡️ Pressione ENTER para continuar..."; }
 
+# Spinner (para mostrar progresso em comandos longos)
+spinner() {
+  local pid=$!
+  local delay=0.1
+  local spinstr='|/-\'
+  while ps -p $pid &>/dev/null; do
+    local temp=${spinstr#?}
+    printf " [%c]  " "$spinstr"
+    spinstr=$temp${spinstr%"$temp"}
+    sleep $delay
+    printf "\b\b\b\b\b\b"
+  done
+}
+
 need_root() {
   if [[ $(id -u) -ne 0 ]]; then
     err "Execute como root."
@@ -19,16 +33,48 @@ need_root() {
 cmd_exists() { command -v "$1" &>/dev/null; }
 
 # ===============================
+# Sessão -1 — Verificação inicial
+# ===============================
+session_precheck() {
+  if [[ -d /etc/pihole || -d /etc/unbound || -f /usr/local/bin/coredns ]]; then
+    warn "🚨 Detectamos uma instalação existente!"
+    echo "O que deseja fazer?"
+    echo "1) Reinstalar (remove tudo e instala novamente)"
+    echo "2) Atualizar pacotes (mantém configs)"
+    echo "3) Cancelar"
+    read -rp "Escolha [1/2/3]: " CHOICE
+    case "$CHOICE" in
+      1)
+        log "Removendo instalação anterior..."
+        systemctl stop pihole-FTL unbound coredns doh-proxy 2>/dev/null || true
+        apt-get purge -y pihole unbound >/dev/null 2>&1 || true
+        rm -rf /etc/pihole /etc/unbound /etc/coredns /opt/coredns /usr/local/bin/coredns
+        rm -f /etc/systemd/system/{pihole-FTL.service,coredns.service,doh-proxy.service}
+        systemctl daemon-reload
+        log "Instalação anterior removida. Continuando..."
+        ;;
+      2)
+        log "Atualizando pacotes..."
+        apt-get update -qq && apt-get upgrade -y
+        log "Atualização concluída. Encerrando."
+        exit 0
+        ;;
+      3|*) log "Abortado."; exit 0 ;;
+    esac
+  fi
+}
+
+# ===============================
 # Sessão 0 — Preparação mínima
 # ===============================
 session0_prep() {
   log "Sessão 0: Instalando pacotes mínimos (rede e utilitários)..."
-  apt-get update -qq
-  apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null
+  (apt-get update -qq && apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null) &
+  spinner
 }
 
 # ===============================
-# Sessão 1 — Detecção de rede (somente aviso, não muda IP)
+# Sessão 1 — Detecção de rede
 # ===============================
 session1_net() {
   log "Sessão 1: Detectando rede..."
@@ -49,8 +95,8 @@ session1_net() {
   log "IP atual:  $CUR_IP"
   log "Máscara:   $SUBNET_MASK"
   echo
-  warn "⚠️ O IP da máquina deve ser FIXO para o ambiente funcionar corretamente."
-  warn "➡️ Configure manualmente um IP fixo ($CUR_IP) no seu host/VM/container."
+  warn "⚠️ Este IP ($CUR_IP) precisa ser FIXO para o ambiente funcionar corretamente."
+  warn "➡️ Configure manualmente o IP fixo no seu host/VM/container antes de prosseguir."
   pause
 }
 
@@ -59,16 +105,22 @@ session1_net() {
 # ===============================
 session2_base() {
   log "Sessão 2: Instalando pacotes base (compiladores, libs, Python, Go, etc)..."
-  apt-get install -y curl wget git lsof bind9-dnsutils unzip tar golang \
-    iproute2 netcat-traditional pipx python3-venv >/dev/null
+  (apt-get install -y curl wget git lsof bind9-dnsutils unzip tar golang \
+    iproute2 netcat-traditional pipx python3-venv >/dev/null) &
+  spinner
 }
 
 # ===============================
 # Sessão 3 — Pi-hole
 # ===============================
 session3_pihole() {
-  log "Sessão 3: Instalando Pi-hole (instalação oficial interativa)..."
-  log "➡️ Durante a instalação, selecione qualquer DNS — depois ajustaremos para Unbound (127.0.0.1#5335)."
+  log "Sessão 3: Instalando Pi-hole..."
+  echo
+  warn "⚠️ IMPORTANTE:"
+  echo "Durante a instalação do Pi-hole, escolha:"
+  echo "   → Upstream DNS Providers → 'Custom'"
+  echo "   → Digite: 127.0.0.1#5335"
+  echo
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
@@ -78,10 +130,10 @@ session3_pihole() {
 # ===============================
 session4_unbound() {
   log "Sessão 4: Instalando e configurando Unbound..."
+  (apt-get install -y unbound >/dev/null) &
+  spinner
 
-  apt-get install -y unbound >/dev/null
   install -d -m 0755 /etc/unbound/unbound.conf.d
-
   cat >/etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
 server:
     verbosity: 1
@@ -104,10 +156,8 @@ EOF
 
   mkdir -p /var/lib/unbound
   wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
-
   systemctl enable --now unbound
-
-  log "➡️ Testando Unbound (127.0.0.1#5335)..."
+  log "➡️ Testando Unbound..."
   dig @127.0.0.1 -p 5335 openai.com +short || true
 }
 
@@ -124,7 +174,6 @@ session5_pihole_conf() {
     } >> /etc/pihole/setupVars.conf
   fi
   systemctl restart pihole-FTL
-  dig @127.0.0.1 -p 53 openai.com +short || true
 }
 
 # ===============================
@@ -132,13 +181,13 @@ session5_pihole_conf() {
 # ===============================
 session6_coredns() {
   log "Sessão 6: Instalando CoreDNS..."
-  cd /opt
-  local COREDNS_VER="1.11.3"
-  curl -fsSL -o coredns.tgz "https://github.com/coredns/coredns/releases/download/v${COREDNS_VER}/coredns_${COREDNS_VER}_linux_amd64.tgz"
-  tar -xzf coredns.tgz
-  install -m 0755 coredns /usr/local/bin/coredns
-  mkdir -p /etc/coredns
+  (cd /opt && \
+    curl -fsSL -o coredns.tgz "https://github.com/coredns/coredns/releases/download/v1.11.3/coredns_1.11.3_linux_amd64.tgz" && \
+    tar -xzf coredns.tgz && \
+    install -m 0755 coredns /usr/local/bin/coredns) &
+  spinner
 
+  mkdir -p /etc/coredns
   cat >/etc/coredns/Corefile <<'EOF'
 .:8053 {
     errors
@@ -172,7 +221,8 @@ EOF
 # ===============================
 session7_doh() {
   log "Sessão 7: Instalando DoH-proxy..."
-  pipx install doh-proxy || true
+  (pipx install doh-proxy >/dev/null || true) &
+  spinner
 
   cat >/etc/systemd/system/doh-proxy.service <<EOF
 [Unit]
@@ -228,17 +278,35 @@ session9_password() {
 # ===============================
 final_msg() {
   echo
-  log "Instalação concluída!"
+  log "✅ Instalação concluída!"
   echo "============================================================"
   echo " IP detectado: $CUR_IP"
   echo
-  echo "➡️ Configure no Nginx Proxy Manager (NPM):"
-  echo "  - DoH: Proxy Host → ${CUR_IP}:8054 → /dns-query (com SSL)"
-  echo "  - DoT: Stream → ${CUR_IP}:8053 → porta 853 (com SSL)"
+  echo "➡️ Agora configure o Nginx Proxy Manager (NPM):"
   echo
-  echo "Exemplos de testes externos:"
-  echo "  kdig @dns.seudominio.com +https=/dns-query openai.com"
-  echo "  kdig @dns.seudominio.com -p 853 +tls openai.com"
+  echo "1) DoH (DNS-over-HTTPS)"
+  echo "   - Vá em Proxy Hosts → Add Proxy Host"
+  echo "   - Domain Names: SEU_DOMINIO (ex.: dns.seusite.com)"
+  echo "   - Scheme: http"
+  echo "   - Forward Host/IP: $CUR_IP"
+  echo "   - Forward Port: 8054"
+  echo "   - Path: /dns-query"
+  echo "   - SSL: Ative e selecione o certificado Let's Encrypt"
+  echo "   - Force SSL: ON"
+  echo
+  echo "2) DoT (DNS-over-TLS)"
+  echo "   - Vá em Streams → Add Stream"
+  echo "   - Incoming port: 853"
+  echo "   - Forward Host: $CUR_IP"
+  echo "   - Forward Port: 8053"
+  echo "   - SSL Certificate: selecione o mesmo domínio"
+  echo
+  echo "3) Testes externos:"
+  echo "   - DoH: kdig @dns.seusite.com +https=/dns-query openai.com"
+  echo "   - DoT: kdig @dns.seusite.com -p 853 +tls +tls-hostname=dns.seusite.com openai.com"
+  echo
+  echo "💡 Em celulares Android/iOS → configure DNS privado com seu domínio (DoT)."
+  echo "💡 Em navegadores/Apps → configure https://dns.seusite.com/dns-query como DoH."
   echo "============================================================"
 }
 
@@ -246,6 +314,7 @@ final_msg() {
 # Main
 # ===============================
 need_root
+session_precheck
 session0_prep
 session1_net
 session2_base
