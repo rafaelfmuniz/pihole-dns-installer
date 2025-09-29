@@ -22,7 +22,13 @@ detect_net() {
   DEF_GW=$(ip -o -4 route show to default | awk '{print $3}' | head -1 || true)
   CUR_IP=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
   CIDR=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | head -1 || true)
-  SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk '/Netmask:/ {print $2}')
+
+  # máscara de rede via ipcalc ou ip
+  if cmd_exists ipcalc; then
+    SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
+  fi
+  [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f2 | head -1)
+  [[ -n "$SUBNET_MASK" && "$SUBNET_MASK" =~ ^[0-9]+$ ]] && SUBNET_MASK=$(ipcalc "$CUR_IP/$SUBNET_MASK" | awk -F= '/NETMASK/{print $2}')
 
   log "Interface padrão: $DEF_IF"
   log "Gateway padrão:   $DEF_GW"
@@ -35,6 +41,7 @@ detect_net() {
   fi
 }
 
+# ===== IP fixo =====
 choose_static_ip() {
   echo
   log "Recomendação: usar IP FIXO (a instalação irá referenciar este IP)."
@@ -49,7 +56,11 @@ choose_static_ip() {
     read -rp "Confirme o IP fixo desejado [$NEW_IP] (ENTER para aceitar): " CONF
     [[ -n "${CONF:-}" ]] && NEW_IP="$CONF"
 
-    read -rp "Informe o(s) DNS local(is) a publicar (ex.: nenhum / deixe em branco): " PUBL_DNS || true
+    read -rp "Informe o(s) DNS local(is) a publicar (ex.: deixe vazio para usar padrão): " PUBL_DNS || true
+    if [[ -z "${PUBL_DNS:-}" ]]; then
+      PUBL_DNS="1.1.1.1 8.8.8.8"
+      log "Nenhum DNS informado. Usando padrão: $PUBL_DNS"
+    fi
 
     if cmd_exists nmcli; then
       log "NetworkManager detectado. Ajustando IP fixo via nmcli..."
@@ -57,12 +68,7 @@ choose_static_ip() {
       if [[ -z "$CONN" ]]; then
         err "Não encontrei conexão ativa no NM. Ajuste manualmente ou use ifupdown."
       else
-        nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW"
-        if [[ -n "${PUBL_DNS:-}" ]]; then
-          nmcli con mod "$CONN" ipv4.dns "$PUBL_DNS"
-        else
-          nmcli con mod "$CONN" -ipv4.dns
-        fi
+        nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW" ipv4.dns "$PUBL_DNS"
         nmcli con down "$CONN" || true
         nmcli con up "$CONN"
         CUR_IP="$NEW_IP"
@@ -80,10 +86,8 @@ iface $DEF_IF inet static
     address $NEW_IP
     netmask ${SUBNET_MASK:-255.255.255.0}
     gateway $DEF_GW
+    dns-nameservers $PUBL_DNS
 EOF
-      if [[ -n "${PUBL_DNS:-}" ]]; then
-        echo "    dns-nameservers $PUBL_DNS" >>"$INTERF"
-      fi
       systemctl restart networking || true
       ip addr flush dev "$DEF_IF" || true
       ifdown "$DEF_IF" || true
@@ -103,7 +107,7 @@ EOF
 install_base() {
   log "Instalando pacotes base..."
   apt update
-  apt install -y curl wget git net-tools lsof dnsutils unzip python3-venv pipx build-essential tar golang iproute2 netcat-traditional ipcalc
+  apt install -y curl wget git net-tools lsof bind9-dnsutils unzip tar golang iproute2 netcat-traditional pipx python3-venv
 }
 
 # ===== Pi-hole =====
@@ -116,8 +120,9 @@ install_pihole() {
 
 # ===== Unbound =====
 install_unbound() {
-  log "Instalando e configurando Unbound..."
+  log "Instalando e configurando Unbound (porta 5335, localhost)..."
   apt install -y unbound
+
   install -d -m 0755 /etc/unbound/unbound.conf.d
   cat >/etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
 server:
@@ -127,21 +132,26 @@ server:
     do-ip4: yes
     do-udp: yes
     do-tcp: yes
+
+    # Root hints
     root-hints: "/var/lib/unbound/root.hints"
+
     harden-glue: yes
     harden-dnssec-stripped: yes
-    edns-buffer-size: 1232
-    prefetch: yes
     qname-minimisation: yes
-    cache-min-ttl: 240
-    cache-max-ttl: 86400
+    prefetch: yes
     hide-identity: yes
     hide-version: yes
+
+    edns-buffer-size: 1232
+    cache-min-ttl: 240
+    cache-max-ttl: 86400
 EOF
 
   mkdir -p /var/lib/unbound
-  wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root
+  wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
 
+  # rotina para atualizar root hints mensalmente
   cat >/etc/cron.monthly/unbound-root-hints <<'EOF'
 #!/usr/bin/env bash
 set -e
@@ -151,11 +161,15 @@ EOF
   chmod +x /etc/cron.monthly/unbound-root-hints
 
   systemctl enable --now unbound
-  log "Testando Unbound local (127.0.0.1#5335)..."
-  dig @127.0.0.1 -p 5335 openai.com +short || true
+
+  # aguarda socket 5335
+  for i in {1..30}; do nc -z 127.0.0.1 5335 && break; sleep 1; done
+
+  log "Teste Unbound (127.0.0.1#5335):"
+  dig @127.0.0.1 -p 5335 openai.com +timeout=2 +short || true
 }
 
-# ===== Ajuste Pi-hole para Unbound =====
+# ===== Ajuste Pi-hole para usar Unbound =====
 configure_pihole_upstream() {
   log "Apontando Pi-hole para Unbound (127.0.0.1#5335)..."
   if [[ -f /etc/pihole/setupVars.conf ]]; then
@@ -166,21 +180,55 @@ configure_pihole_upstream() {
     } >> /etc/pihole/setupVars.conf
   fi
 
+  # Unit com dependência do Unbound e espera ativa
+  cat >/etc/systemd/system/pihole-FTL.service <<'EOF'
+[Unit]
+Description=Pi-hole FTL
+After=network-online.target unbound.service
+Requires=unbound.service
+Wants=network-online.target
+
+[Service]
+User=pihole
+PermissionsStartOnly=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_NICE CAP_IPC_LOCK CAP_CHOWN CAP_SYS_TIME
+ExecStartPre=/bin/bash -c 'for i in {1..30}; do nc -z 127.0.0.1 5335 && exit 0; sleep 1; done; exit 1'
+ExecStartPre=/opt/pihole/pihole-FTL-prestart.sh
+ExecStart=/usr/bin/pihole-FTL -f
+Restart=on-failure
+RestartSec=5s
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=/opt/pihole/pihole-FTL-poststop.sh
+TimeoutStopSec=60s
+ProtectSystem=full
+ReadWriteDirectories=/etc/pihole
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now pihole-FTL
   systemctl restart pihole-FTL
-  dig @127.0.0.1 -p 53 openai.com +short || true
+
+  # aguarda porta 53 responder
+  for i in {1..30}; do nc -z 127.0.0.1 53 && break; sleep 1; done
+
+  log "Teste Pi-hole (127.0.0.1#53):"
+  dig @127.0.0.1 -p 53 openai.com +timeout=2 +short || true
 }
 
-# ===== CoreDNS =====
+# ===== CoreDNS (ouvindo em :8053) =====
 install_coredns() {
   log "Instalando CoreDNS..."
   cd /opt
-  COREDNS_VER="1.11.3"
+  local COREDNS_VER="1.11.3"
   curl -fsSL -o coredns.tgz "https://github.com/coredns/coredns/releases/download/v${COREDNS_VER}/coredns_${COREDNS_VER}_linux_amd64.tgz"
   tar -xzf coredns.tgz
   install -m 0755 coredns /usr/local/bin/coredns
   mkdir -p /etc/coredns
 
-  # Corefile
+  # Corefile: porta 8053 (TCP/UDP), sem TLS; NPM fará TLS/LE em 853
   cat >/etc/coredns/Corefile <<'EOF'
 .:8053 {
     errors
@@ -190,9 +238,10 @@ install_coredns() {
 }
 EOF
 
+  # systemd
   cat >/etc/systemd/system/coredns.service <<'EOF'
 [Unit]
-Description=CoreDNS
+Description=CoreDNS (listens on :8053)
 After=network.target pihole-FTL.service unbound.service
 Requires=pihole-FTL.service unbound.service
 
@@ -207,16 +256,20 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now coredns
+
+  # aguarda porta 8053
+  for i in {1..30}; do nc -z 127.0.0.1 8053 && break; sleep 1; done
 }
 
-# ===== DoH-Proxy =====
+# ===== DoH-Proxy (aiohttp) porta interna 8054 =====
 install_doh_proxy() {
-  log "Instalando DoH-Proxy..."
-  pipx install doh-proxy
+  log "Instalando DoH-proxy..."
+  pipx install doh-proxy || true
 
+  # service (escuta no IP atual e porta 8054; upstream = Pi-hole 127.0.0.1:53)
   cat >/etc/systemd/system/doh-proxy.service <<EOF
 [Unit]
-Description=DoH Proxy
+Description=DoH HTTP Proxy (para NPM -> /dns-query)
 After=network.target pihole-FTL.service unbound.service
 Requires=pihole-FTL.service unbound.service
 
@@ -228,6 +281,7 @@ ExecStart=/root/.local/bin/doh-httpproxy \\
   --upstream-resolver=127.0.0.1 \\
   --upstream-port=53
 Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -235,14 +289,88 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now doh-proxy
+
+  # aguarda 8054
+  for i in {1..30}; do nc -z "$CUR_IP" 8054 && break; sleep 1; done
+
+  log "Teste DoH-proxy local (DNS JSON):"
+  curl -s -H 'accept: application/dns-json' \
+    "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
 }
 
-# ===== testes =====
+# ===== testes finais =====
 final_tests() {
-  log "Testando stack local..."
+  echo
+  log "Testes locais rápidos:"
+  echo "1) Unbound: dig @127.0.0.1 -p 5335 openai.com +short"
   dig @127.0.0.1 -p 5335 openai.com +short || true
+  echo
+  echo "2) Pi-hole: dig @127.0.0.1 -p 53 openai.com +short"
   dig @127.0.0.1 -p 53 openai.com +short || true
-  curl -s -H 'accept: application/dns-json' "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
+  echo
+  echo "3) CoreDNS (TCP/UDP :8053): dig @127.0.0.1 -p 8053 openai.com +short"
+  dig @127.0.0.1 -p 8053 openai.com +short || true
+  echo
+  echo "4) DoH proxy HTTP (8054):"
+  curl -s -H 'accept: application/dns-json' \
+    "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
+  echo
+}
+
+# ===== instruções NPM =====
+print_npm_instructions() {
+cat <<EOF
+
+============================================================
+NPM (Nginx Proxy Manager) — CHECKLIST
+============================================================
+
+Pré-requisito: seu domínio (ex.: dns.seudominio.com) aponta para o IP público do NPM.
+Encaminhe as portas externas 80/443/853 para o host do NPM.
+
+1) Certificado (Let's Encrypt):
+   - Hosts → SSL Certificates → Add → Let's Encrypt
+   - Domain Names: dns.seudominio.com
+   - HTTP-01 (ou DNS-01)
+   - Salvar
+
+2) DoH (443 -> /dns-query):
+   - Hosts → Proxy Hosts → Add Proxy Host
+   - Domain Names: dns.seudominio.com
+   - Scheme: http
+   - Forward Hostname/IP: ${CUR_IP}
+   - Forward Port: 8054
+   - Block Common Exploits: ON
+   - Websockets: ON (opcional)
+   - SSL: Enable → selecione o certificado
+   - Force SSL: ON
+   - HTTP/2: ON
+   - Salvar
+   Teste externo:
+     kdig @dns.seudominio.com +https=/dns-query openai.com
+
+3) DoT (853):
+   - Hosts → Streams → Add Stream
+   - Incoming port: 853
+   - TCP: ON / UDP: OFF
+   - Forward Host: ${CUR_IP}
+   - Forward Port: 8053
+   - SSL Certificate: dns.seudominio.com  (terminar TLS na stream)
+   - Salvar
+   Teste externo:
+     kdig openai.com @dns.seudominio.com -p 853 +tls +tls-hostname=dns.seudominio.com
+
+Observações:
+- Se sua build do NPM não permitir “Enable SSL” em Streams,
+  o 853 ficará como TCP puro → isso NÃO entrega DoT. Nesse caso,
+  a alternativa é terminar TLS no próprio DNS (CoreDNS com plugin TLS).
+  Nosso layout assume TLS encerrado no NPM.
+- Em Android (DNS privado/DoT): use apenas o hostname (dns.seudominio.com).
+- DoH em apps (ex.: Intra): https://dns.seudominio.com/dns-query
+
+============================================================
+
+EOF
 }
 
 # ===== main =====
@@ -256,5 +384,9 @@ configure_pihole_upstream
 install_coredns
 install_doh_proxy
 final_tests
+print_npm_instructions
 
 log "Concluído! Reboot recomendado para validar ordem de serviços."
+echo "Depois do reboot:"
+echo "  systemctl status unbound pihole-FTL coredns doh-proxy"
+echo "  ss -lntup | grep -E ':53|:5335|:8053|:8054'"
