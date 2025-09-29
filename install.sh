@@ -101,7 +101,6 @@ install_base() {
 # ===== Pi-hole =====
 install_pihole() {
   log "Instalando Pi-hole (instalação interativa oficial)..."
-  log "Durante a instalação você poderá definir DNS upstream, mas ajustaremos depois para Unbound (127.0.0.1#5335)."
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
@@ -151,13 +150,9 @@ EOF
     journalctl -xeu unbound.service | tail -n 20
     exit 1
   }
-
-  for i in {1..30}; do nc -z 127.0.0.1 5335 && break; sleep 1; done
-  log "Teste Unbound (127.0.0.1#5335):"
-  dig @127.0.0.1 -p 5335 openai.com +short || true
 }
 
-# ===== Ajuste Pi-hole para usar Unbound =====
+# ===== Ajuste Pi-hole =====
 configure_pihole_upstream() {
   log "Apontando Pi-hole para Unbound (127.0.0.1#5335)..."
   if [[ -f /etc/pihole/setupVars.conf ]]; then
@@ -237,7 +232,6 @@ EOF
 
 # ===== testes finais =====
 final_tests() {
-  echo
   log "Testes locais rápidos:"
   dig @127.0.0.1 -p 5335 openai.com +short || true
   dig @127.0.0.1 -p 53 openai.com +short || true
@@ -254,12 +248,9 @@ cat <<EOF
 NPM (Nginx Proxy Manager) — CHECKLIST
 ============================================================
 1) DoH → Proxy Host
-   Domain: dns.seudominio.com
-   Forward: ${CUR_IP}:8054 (/dns-query)
-   SSL ativo
+   Forward: ${CUR_IP}:8054 (/dns-query) com SSL
 2) DoT → Stream
-   Porta 853 → ${CUR_IP}:8053
-   SSL com certificado do domínio
+   Porta 853 → ${CUR_IP}:8053 com SSL
 ============================================================
 
 EOF
@@ -267,7 +258,7 @@ EOF
 
 # ===== main =====
 need_root
-install_nettools
+install_nettools    # <-- garante ipcalc antes
 detect_net
 choose_static_ip
 install_base
