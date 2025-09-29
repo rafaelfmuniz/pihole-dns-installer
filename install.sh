@@ -16,6 +16,12 @@ need_root() {
 
 cmd_exists() { command -v "$1" &>/dev/null; }
 
+# ===== pacotes mínimos para detectar rede =====
+install_nettools() {
+  apt-get update -qq
+  apt-get install -y iproute2 net-tools ipcalc >/dev/null
+}
+
 # ===== detecção de rede =====
 detect_net() {
   DEF_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1 || true)
@@ -23,7 +29,6 @@ detect_net() {
   CUR_IP=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
   CIDR=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | head -1 || true)
 
-  # máscara de rede via ipcalc ou ip
   if cmd_exists ipcalc; then
     SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
   fi
