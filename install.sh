@@ -6,32 +6,60 @@ log() { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 err() { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
 pause() { read -rp "Pressione ENTER para continuar..."; }
+cmd_exists() { command -v "$1" &>/dev/null; }
 
-need_root() {
-  if [[ $(id -u) -ne 0 ]]; then
-    err "Execute como root."
-    exit 1
+need_root() { [[ $(id -u) -eq 0 ]] || { err "Execute como root."; exit 1; }; }
+
+# ===== DNS temporário para apt =====
+BACKUP_RESOLV=""
+ensure_dns_connectivity() {
+  # Tenta resolver/baixar algo rápido
+  if getent hosts deb.debian.org >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "Resolução DNS parece indisponível. Aplicando DNS temporário (1.1.1.1 / 8.8.8.8)..."
+
+  if cmd_exists resolvectl && systemctl is-active --quiet systemd-resolved; then
+    # Aplica DNS na interface padrão sem quebrar gerência do resolved
+    local ifc
+    ifc=$(ip -o -4 route show to default | awk '{print $5}' | head -1 || true)
+    [[ -n "$ifc" ]] && resolvectl dns "$ifc" 1.1.1.1 8.8.8.8 || resolvectl dns 1.1.1.1 8.8.8.8 || true
+    resolvectl flush-caches || true
+  else
+    # Escreve /etc/resolv.conf diretamente, preservando backup 1x
+    if [[ -f /etc/resolv.conf && -z "${BACKUP_RESOLV:-}" ]]; then
+      cp -a /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%s)" && BACKUP_RESOLV=1 || true
+    fi
+    cat >/etc/resolv.conf <<EOF
+# Temporary resolv.conf set by installer
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+EOF
   fi
 }
 
-cmd_exists() { command -v "$1" &>/dev/null; }
-
-# ===== pacotes mínimos =====
-install_nettools() {
-  log "Instalando pacotes básicos de rede (iproute2, net-tools, ipcalc)..."
-  apt-get update -qq
-  apt-get install -y iproute2 net-tools ipcalc >/dev/null
+# ===== pacotes mínimos antes de qualquer coisa =====
+install_prereqs() {
+  ensure_dns_connectivity
+  log "Instalando pacotes mínimos (iproute2, net-tools, ipcalc, curl, ca-certificates, netcat)..."
+  apt-get update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    iproute2 net-tools ipcalc curl ca-certificates netcat-traditional bind9-dnsutils lsof >/dev/null || true
 }
 
 # ===== detecção de rede =====
+DEF_IF=""; DEF_GW=""; CUR_IP=""; CIDR=""; SUBNET_MASK=""
 detect_net() {
   DEF_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1 || true)
   DEF_GW=$(ip -o -4 route show to default | awk '{print $3}' | head -1 || true)
   CUR_IP=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
   CIDR=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | head -1 || true)
 
-  if cmd_exists ipcalc; then
-    SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
+  # Máscara com ipcalc (aceita formatos distintos)
+  if cmd_exists ipcalc && [[ -n "$CIDR" ]]; then
+    SUBNET_MASK=$(ipcalc -m "$CIDR" 2>/dev/null | awk -F= '/NETMASK/{print $2}')
+    [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk '/Netmask:/{print $2}')
   fi
   [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK="255.255.255.0"
 
@@ -61,21 +89,31 @@ choose_static_ip() {
     read -rp "Confirme o IP fixo desejado [$NEW_IP] (ENTER para aceitar): " CONF
     [[ -n "${CONF:-}" ]] && NEW_IP="$CONF"
 
-    read -rp "Informe o(s) DNS local(is) a publicar (ENTER para padrão): " PUBL_DNS || true
-    [[ -z "${PUBL_DNS:-}" ]] && PUBL_DNS="1.1.1.1 8.8.8.8"
+    read -rp "DNS a publicar (opcional, ex.: 1.1.1.1 9.9.9.9) [ENTER p/ automático]: " PUBL_DNS || true
 
     if cmd_exists nmcli; then
       log "NetworkManager detectado. Ajustando IP fixo via nmcli..."
       CONN=$(nmcli -t -f NAME con show --active | head -1)
-      nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW" ipv4.dns "$PUBL_DNS"
-      nmcli con down "$CONN" || true
-      nmcli con up "$CONN"
-      CUR_IP="$NEW_IP"
-      log "IP fixo aplicado via NetworkManager: $CUR_IP"
+      if [[ -z "$CONN" ]]; then
+        err "Nenhuma conexão ativa encontrada no NetworkManager."
+      else
+        nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW"
+        if [[ -n "${PUBL_DNS:-}" ]]; then
+          nmcli con mod "$CONN" ipv4.dns "$PUBL_DNS"
+        else
+          nmcli con mod "$CONN" ipv4.ignore-auto-dns yes
+          nmcli con mod "$CONN" ipv4.dns "1.1.1.1 8.8.8.8"
+        fi
+        nmcli con down "$CONN" || true
+        nmcli con up "$CONN"
+        CUR_IP="$NEW_IP"
+        log "IP fixo aplicado via NetworkManager: $CUR_IP"
+      fi
     elif [[ -f /etc/network/interfaces ]]; then
       log "ifupdown detectado. Vou preparar bloco estático para $DEF_IF."
       INTERF=/etc/network/interfaces
       cp -a "$INTERF" "${INTERF}.bak.$(date +%s)"
+      # remove bloco antigo da iface
       sed -i "/^auto $DEF_IF$/,/^$/d" "$INTERF"
       cat >>"$INTERF" <<EOF
 
@@ -84,8 +122,12 @@ iface $DEF_IF inet static
     address $NEW_IP
     netmask ${SUBNET_MASK:-255.255.255.0}
     gateway $DEF_GW
-    dns-nameservers $PUBL_DNS
 EOF
+      if [[ -n "${PUBL_DNS:-}" ]]; then
+        echo "    dns-nameservers $PUBL_DNS" >>"$INTERF"
+      else
+        echo "    dns-nameservers 1.1.1.1 8.8.8.8" >>"$INTERF"
+      fi
       systemctl restart networking || true
       ip addr flush dev "$DEF_IF" || true
       ifdown "$DEF_IF" || true
@@ -94,33 +136,30 @@ EOF
       log "IP fixo aplicado via ifupdown: $CUR_IP"
     else
       warn "Nem NetworkManager nem ifupdown detectados. Pulei ajuste automático."
+      warn "Se necessário, fixe IP manualmente e rode o script de novo."
     fi
+
+    # Garante DNS funcional após a troca de IP
+    ensure_dns_connectivity
   else
     log "Mantendo IP atual (DHCP): $CUR_IP"
+    ensure_dns_connectivity
   fi
 }
-
-# ===== resto das funções (Pi-hole, Unbound, CoreDNS, DoH-proxy, testes, etc.) =====
-# Mantém tudo igual à sua versão que já funcionava
-
-# ===== main =====
-need_root
-install_nettools     # <-- ipcalc instalado ANTES de detect_net
-detect_net
-choose_static_ip
-# aqui depois seguem: install_base, install_pihole, install_unbound, configure_pihole_upstream, install_coredns, install_doh_proxy, final_tests, print_npm_instructions
 
 # ===== pacotes base =====
 install_base() {
   log "Instalando pacotes base..."
-  apt update
-  apt install -y curl wget git net-tools lsof bind9-dnsutils unzip tar golang iproute2 netcat-traditional pipx python3-venv
+  apt-get update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    curl wget git net-tools lsof bind9-dnsutils unzip tar golang iproute2 netcat-traditional \
+    pipx python3-venv ca-certificates >/dev/null || true
 }
 
 # ===== Pi-hole =====
 install_pihole() {
   log "Instalando Pi-hole (instalação interativa oficial)..."
-  log "Durante a instalação você poderá definir DNS upstream, mas ajustaremos depois para Unbound (127.0.0.1#5335)."
+  log "Durante a instalação você poderá definir DNS upstream; depois ajustaremos para Unbound (127.0.0.1#5335)."
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
@@ -128,7 +167,8 @@ install_pihole() {
 # ===== Unbound =====
 install_unbound() {
   log "Instalando e configurando Unbound (porta 5335, localhost)..."
-  apt install -y unbound
+  apt-get update -qq || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y unbound >/dev/null || true
 
   install -d -m 0755 /etc/unbound/unbound.conf.d
   cat >/etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
@@ -139,26 +179,21 @@ server:
     do-ip4: yes
     do-udp: yes
     do-tcp: yes
-
-    # Root hints
     root-hints: "/var/lib/unbound/root.hints"
-
     harden-glue: yes
     harden-dnssec-stripped: yes
-    qname-minimisation: yes
-    prefetch: yes
-    hide-identity: yes
-    hide-version: yes
-
     edns-buffer-size: 1232
+    prefetch: yes
+    qname-minimisation: yes
     cache-min-ttl: 240
     cache-max-ttl: 86400
+    hide-identity: yes
+    hide-version: yes
 EOF
 
   mkdir -p /var/lib/unbound
   wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
 
-  # rotina para atualizar root hints mensalmente
   cat >/etc/cron.monthly/unbound-root-hints <<'EOF'
 #!/usr/bin/env bash
 set -e
@@ -168,12 +203,11 @@ EOF
   chmod +x /etc/cron.monthly/unbound-root-hints
 
   systemctl enable --now unbound
-
-  # aguarda socket 5335
+  # espera Unbound abrir 5335
   for i in {1..30}; do nc -z 127.0.0.1 5335 && break; sleep 1; done
 
   log "Teste Unbound (127.0.0.1#5335):"
-  dig @127.0.0.1 -p 5335 openai.com +timeout=2 +short || true
+  dig @127.0.0.1 -p 5335 openai.com +timeout=3 +short || true
 }
 
 # ===== Ajuste Pi-hole para usar Unbound =====
@@ -187,7 +221,6 @@ configure_pihole_upstream() {
     } >> /etc/pihole/setupVars.conf
   fi
 
-  # Unit com dependência do Unbound e espera ativa
   cat >/etc/systemd/system/pihole-FTL.service <<'EOF'
 [Unit]
 Description=Pi-hole FTL
@@ -217,15 +250,13 @@ EOF
   systemctl daemon-reload
   systemctl enable --now pihole-FTL
   systemctl restart pihole-FTL
-
-  # aguarda porta 53 responder
   for i in {1..30}; do nc -z 127.0.0.1 53 && break; sleep 1; done
 
   log "Teste Pi-hole (127.0.0.1#53):"
-  dig @127.0.0.1 -p 53 openai.com +timeout=2 +short || true
+  dig @127.0.0.1 -p 53 openai.com +timeout=3 +short || true
 }
 
-# ===== CoreDNS (ouvindo em :8053) =====
+# ===== CoreDNS (TCP/UDP :8053 — NPM termina TLS no 853) =====
 install_coredns() {
   log "Instalando CoreDNS..."
   cd /opt
@@ -235,7 +266,6 @@ install_coredns() {
   install -m 0755 coredns /usr/local/bin/coredns
   mkdir -p /etc/coredns
 
-  # Corefile: porta 8053 (TCP/UDP), sem TLS; NPM fará TLS/LE em 853
   cat >/etc/coredns/Corefile <<'EOF'
 .:8053 {
     errors
@@ -245,7 +275,6 @@ install_coredns() {
 }
 EOF
 
-  # systemd
   cat >/etc/systemd/system/coredns.service <<'EOF'
 [Unit]
 Description=CoreDNS (listens on :8053)
@@ -263,17 +292,21 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now coredns
-
-  # aguarda porta 8053
   for i in {1..30}; do nc -z 127.0.0.1 8053 && break; sleep 1; done
+
+  log "Teste CoreDNS :8053:"
+  dig @127.0.0.1 -p 8053 openai.com +timeout=3 +short || true
 }
 
 # ===== DoH-Proxy (aiohttp) porta interna 8054 =====
 install_doh_proxy() {
-  log "Instalando DoH-proxy..."
+  log "Instalando DoH-proxy (pipx)..."
+  # Garante pipx no PATH deste shell
+  python3 -m pipx ensurepath >/dev/null 2>&1 || true
+  # Instala
   pipx install doh-proxy || true
 
-  # service (escuta no IP atual e porta 8054; upstream = Pi-hole 127.0.0.1:53)
+  # Service escutando no IP local atual; NPM termina TLS e encaminha para /dns-query
   cat >/etc/systemd/system/doh-proxy.service <<EOF
 [Unit]
 Description=DoH HTTP Proxy (para NPM -> /dns-query)
@@ -296,11 +329,9 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now doh-proxy
-
-  # aguarda 8054
   for i in {1..30}; do nc -z "$CUR_IP" 8054 && break; sleep 1; done
 
-  log "Teste DoH-proxy local (DNS JSON):"
+  log "Teste DoH-proxy (dns-json):"
   curl -s -H 'accept: application/dns-json' \
     "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
 }
@@ -369,9 +400,8 @@ Encaminhe as portas externas 80/443/853 para o host do NPM.
 
 Observações:
 - Se sua build do NPM não permitir “Enable SSL” em Streams,
-  o 853 ficará como TCP puro → isso NÃO entrega DoT. Nesse caso,
-  a alternativa é terminar TLS no próprio DNS (CoreDNS com plugin TLS).
-  Nosso layout assume TLS encerrado no NPM.
+  o 853 ficará como TCP puro → isso NÃO entrega DoT. Alternativa:
+  terminar TLS no próprio DNS (CoreDNS com plugin TLS).
 - Em Android (DNS privado/DoT): use apenas o hostname (dns.seudominio.com).
 - DoH em apps (ex.: Intra): https://dns.seudominio.com/dns-query
 
@@ -382,6 +412,7 @@ EOF
 
 # ===== main =====
 need_root
+install_prereqs       # ipcalc + rede + DNS temporário antes de tudo
 detect_net
 choose_static_ip
 install_base
@@ -397,3 +428,4 @@ log "Concluído! Reboot recomendado para validar ordem de serviços."
 echo "Depois do reboot:"
 echo "  systemctl status unbound pihole-FTL coredns doh-proxy"
 echo "  ss -lntup | grep -E ':53|:5335|:8053|:8054'"
+
