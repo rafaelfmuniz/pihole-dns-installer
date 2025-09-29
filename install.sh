@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== utils =====
+# ===== util =====
 log() { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 err() { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
 pause() { read -rp "Pressione ENTER para continuar..."; }
-cmd_exists() { command -v "$1" &>/dev/null; }
 
 need_root() {
   if [[ $(id -u) -ne 0 ]]; then
@@ -15,11 +14,13 @@ need_root() {
   fi
 }
 
+cmd_exists() { command -v "$1" &>/dev/null; }
+
 # ===== pacotes mínimos =====
 install_nettools() {
   log "Instalando pacotes mínimos (iproute2, net-tools, ipcalc, curl, ca-certificates, netcat)..."
   apt-get update -qq
-  apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null
+  apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null || true
 }
 
 # ===== detecção de rede =====
@@ -29,15 +30,20 @@ detect_net() {
   CUR_IP=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
   CIDR=$(ip -o -4 addr show dev "$DEF_IF" | awk '{print $4}' | head -1 || true)
 
-  if cmd_exists ipcalc; then
-    SUBNET_MASK=$(ipcalc "$CIDR" 2>/dev/null | awk -F= '/Netmask:/ {print $2}')
-  fi
-  [[ -z "${SUBNET_MASK:-}" ]] && SUBNET_MASK="255.255.255.0"
+  # Pega prefixo e converte para máscara
+  PREFIX=$(echo "$CIDR" | cut -d/ -f2)
+  case $PREFIX in
+    8)   SUBNET_MASK="255.0.0.0" ;;
+    16)  SUBNET_MASK="255.255.0.0" ;;
+    24)  SUBNET_MASK="255.255.255.0" ;;
+    32)  SUBNET_MASK="255.255.255.255" ;;
+    *)   SUBNET_MASK="255.255.255.0" ;;
+  esac
 
   log "Interface padrão: $DEF_IF"
   log "Gateway padrão:   $DEF_GW"
   log "IP atual:         $CUR_IP"
-  log "Máscara:          ${SUBNET_MASK:-desconhecida}"
+  log "Máscara:          $SUBNET_MASK"
 
   if [[ -z "${CUR_IP:-}" || -z "${DEF_IF:-}" || -z "${DEF_GW:-}" ]]; then
     err "Não foi possível detectar rede automaticamente. Configure rede e execute novamente."
@@ -63,7 +69,15 @@ choose_static_ip() {
     read -rp "Informe o(s) DNS local(is) a publicar (ENTER para padrão): " PUBL_DNS || true
     [[ -z "${PUBL_DNS:-}" ]] && PUBL_DNS="1.1.1.1 8.8.8.8"
 
-    if [[ -f /etc/network/interfaces ]]; then
+    if cmd_exists nmcli; then
+      log "NetworkManager detectado. Ajustando IP fixo via nmcli..."
+      CONN=$(nmcli -t -f NAME con show --active | head -1)
+      nmcli con mod "$CONN" ipv4.method manual ipv4.addresses "${NEW_IP}/24" ipv4.gateway "$DEF_GW" ipv4.dns "$PUBL_DNS"
+      nmcli con down "$CONN" || true
+      nmcli con up "$CONN"
+      CUR_IP="$NEW_IP"
+      log "IP fixo aplicado via NetworkManager: $CUR_IP"
+    elif [[ -f /etc/network/interfaces ]]; then
       log "ifupdown detectado. Vou preparar bloco estático para $DEF_IF."
       INTERF=/etc/network/interfaces
       cp -a "$INTERF" "${INTERF}.bak.$(date +%s)"
@@ -73,7 +87,7 @@ choose_static_ip() {
 auto $DEF_IF
 iface $DEF_IF inet static
     address $NEW_IP
-    netmask ${SUBNET_MASK:-255.255.255.0}
+    netmask $SUBNET_MASK
     gateway $DEF_GW
     dns-nameservers $PUBL_DNS
 EOF
@@ -84,7 +98,7 @@ EOF
       CUR_IP="$NEW_IP"
       log "IP fixo aplicado via ifupdown: $CUR_IP"
     else
-      warn "ifupdown não detectado. Pulei ajuste automático."
+      warn "Nem NetworkManager nem ifupdown detectados. Pulei ajuste automático."
     fi
   else
     log "Mantendo IP atual (DHCP): $CUR_IP"
@@ -94,29 +108,21 @@ EOF
 # ===== pacotes base =====
 install_base() {
   log "Instalando pacotes base..."
-  apt-get update -qq
-  apt-get install -y curl wget git net-tools lsof bind9-dnsutils unzip tar golang iproute2 netcat-traditional pipx python3-venv unbound
+  apt update -qq
+  apt install -y curl wget git net-tools lsof bind9-dnsutils unzip tar golang iproute2 netcat-traditional pipx python3-venv unbound
 }
 
 # ===== Pi-hole =====
 install_pihole() {
   log "Instalando Pi-hole (instalação interativa oficial)..."
+  log "Durante a instalação você poderá definir DNS upstream, mas ajustaremos depois para Unbound (127.0.0.1#5335)."
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
 
 # ===== Unbound =====
 install_unbound() {
-  log "Configurando Unbound (porta 5335, localhost)..."
-
-  mkdir -p /var/lib/unbound
-  wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root
-
-  cat >/etc/unbound/unbound.conf <<'EOF'
-server:
-    directory: "/etc/unbound"
-include: "/etc/unbound/unbound.conf.d/*.conf"
-EOF
+  log "Instalando e configurando Unbound (porta 5335, localhost)..."
 
   install -d -m 0755 /etc/unbound/unbound.conf.d
   cat >/etc/unbound/unbound.conf.d/pi-hole.conf <<'EOF'
@@ -127,32 +133,34 @@ server:
     do-ip4: yes
     do-udp: yes
     do-tcp: yes
+
     root-hints: "/var/lib/unbound/root.hints"
+
     harden-glue: yes
     harden-dnssec-stripped: yes
     qname-minimisation: yes
     prefetch: yes
     hide-identity: yes
     hide-version: yes
+
     edns-buffer-size: 1232
     cache-min-ttl: 240
     cache-max-ttl: 86400
 EOF
 
-  if ! unbound-checkconf; then
-    err "Configuração inválida do Unbound."
-    exit 1
-  fi
+  mkdir -p /var/lib/unbound
+  wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
 
-  systemctl daemon-reexec
-  systemctl enable --now unbound || {
-    err "Unbound falhou ao iniciar. Logs:"
-    journalctl -xeu unbound.service | tail -n 20
-    exit 1
-  }
+  systemctl enable --now unbound
+
+  # aguarda socket 5335
+  for i in {1..30}; do nc -z 127.0.0.1 5335 && break; sleep 1; done
+
+  log "Teste Unbound (127.0.0.1#5335):"
+  dig @127.0.0.1 -p 5335 openai.com +timeout=2 +short || true
 }
 
-# ===== Ajuste Pi-hole =====
+# ===== Ajuste Pi-hole para usar Unbound =====
 configure_pihole_upstream() {
   log "Apontando Pi-hole para Unbound (127.0.0.1#5335)..."
   if [[ -f /etc/pihole/setupVars.conf ]]; then
@@ -162,10 +170,19 @@ configure_pihole_upstream() {
       echo "PIHOLE_DNS_2="
     } >> /etc/pihole/setupVars.conf
   fi
+
+  systemctl daemon-reload
+  systemctl enable --now pihole-FTL
   systemctl restart pihole-FTL
+
+  # aguarda porta 53 responder
+  for i in {1..30}; do nc -z 127.0.0.1 53 && break; sleep 1; done
+
+  log "Teste Pi-hole (127.0.0.1#53):"
+  dig @127.0.0.1 -p 53 openai.com +timeout=2 +short || true
 }
 
-# ===== CoreDNS =====
+# ===== CoreDNS (ouvindo em :8053) =====
 install_coredns() {
   log "Instalando CoreDNS..."
   cd /opt
@@ -193,6 +210,7 @@ Requires=pihole-FTL.service unbound.service
 [Service]
 ExecStart=/usr/local/bin/coredns -conf /etc/coredns/Corefile
 Restart=always
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -200,16 +218,18 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now coredns
+
+  for i in {1..30}; do nc -z 127.0.0.1 8053 && break; sleep 1; done
 }
 
-# ===== DoH-proxy =====
+# ===== DoH-Proxy (aiohttp) porta interna 8054 =====
 install_doh_proxy() {
   log "Instalando DoH-proxy..."
   pipx install doh-proxy || true
 
   cat >/etc/systemd/system/doh-proxy.service <<EOF
 [Unit]
-Description=DoH HTTP Proxy
+Description=DoH HTTP Proxy (para NPM -> /dns-query)
 After=network.target pihole-FTL.service unbound.service
 Requires=pihole-FTL.service unbound.service
 
@@ -221,6 +241,7 @@ ExecStart=/root/.local/bin/doh-httpproxy \\
   --upstream-resolver=127.0.0.1 \\
   --upstream-port=53
 Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -228,16 +249,31 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now doh-proxy
+
+  for i in {1..30}; do nc -z "$CUR_IP" 8054 && break; sleep 1; done
+
+  log "Teste DoH-proxy local:"
+  curl -s -H 'accept: application/dns-json' \
+    "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
 }
 
 # ===== testes finais =====
 final_tests() {
+  echo
   log "Testes locais rápidos:"
+  echo "1) Unbound: dig @127.0.0.1 -p 5335 openai.com +short"
   dig @127.0.0.1 -p 5335 openai.com +short || true
+  echo
+  echo "2) Pi-hole: dig @127.0.0.1 -p 53 openai.com +short"
   dig @127.0.0.1 -p 53 openai.com +short || true
+  echo
+  echo "3) CoreDNS (TCP/UDP :8053): dig @127.0.0.1 -p 8053 openai.com +short"
   dig @127.0.0.1 -p 8053 openai.com +short || true
+  echo
+  echo "4) DoH proxy HTTP (8054):"
   curl -s -H 'accept: application/dns-json' \
     "http://${CUR_IP}:8054/dns-query?name=openai.com&type=A" || true
+  echo
 }
 
 # ===== instruções NPM =====
@@ -247,10 +283,31 @@ cat <<EOF
 ============================================================
 NPM (Nginx Proxy Manager) — CHECKLIST
 ============================================================
-1) DoH → Proxy Host
-   Forward: ${CUR_IP}:8054 (/dns-query) com SSL
-2) DoT → Stream
-   Porta 853 → ${CUR_IP}:8053 com SSL
+
+1) Certificado (Let's Encrypt):
+   - Hosts → SSL Certificates → Add → Let's Encrypt
+   - Domain Names: dns.seudominio.com
+   - HTTP-01 (ou DNS-01)
+   - Salvar
+
+2) DoH (443 -> /dns-query):
+   - Hosts → Proxy Hosts → Add Proxy Host
+   - Domain Names: dns.seudominio.com
+   - Scheme: http
+   - Forward Hostname/IP: ${CUR_IP}
+   - Forward Port: 8054
+   - SSL: Enable → selecione o certificado
+   - Force SSL: ON
+   - HTTP/2: ON
+
+3) DoT (853):
+   - Hosts → Streams → Add Stream
+   - Incoming port: 853
+   - TCP: ON
+   - Forward Host: ${CUR_IP}
+   - Forward Port: 8053
+   - SSL Certificate: dns.seudominio.com
+
 ============================================================
 
 EOF
@@ -258,7 +315,7 @@ EOF
 
 # ===== main =====
 need_root
-install_nettools    # <-- garante ipcalc antes
+install_nettools
 detect_net
 choose_static_ip
 install_base
@@ -269,4 +326,8 @@ install_coredns
 install_doh_proxy
 final_tests
 print_npm_instructions
+
 log "Concluído! Reboot recomendado."
+echo "Depois do reboot:"
+echo "  systemctl status unbound pihole-FTL coredns doh-proxy"
+echo "  ss -lntup | grep -E ':53|:5335|:8053|:8054'"
