@@ -1,8 +1,4 @@
 
-## 3. Updated Script (English Comments)
-
-Here's your script with English comments and organization:
-
 ```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
