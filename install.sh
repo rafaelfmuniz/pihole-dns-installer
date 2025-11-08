@@ -1,15 +1,21 @@
+
+## 3. Updated Script (English Comments)
+
+Here's your script with English comments and organization:
+
+```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 # ===============================
-# Utilidades
+# Utilities
 # ===============================
 log()   { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn()  { echo -e "\e[1;33m[!]\e[0m $*"; }
 err()   { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
-pause() { read -rp "➡️ Pressione ENTER para continuar..."; }
+pause() { read -rp "➡️ Press ENTER to continue..."; }
 
-# Spinner (para mostrar progresso em comandos longos)
+# Spinner for long-running commands
 spinner() {
   local pid=$!
   local delay=0.1
@@ -25,7 +31,7 @@ spinner() {
 
 need_root() {
   if [[ $(id -u) -ne 0 ]]; then
-    err "Execute como root."
+    err "Please run as root."
     exit 1
   fi
 }
@@ -33,51 +39,51 @@ need_root() {
 cmd_exists() { command -v "$1" &>/dev/null; }
 
 # ===============================
-# Sessão -1 — Verificação inicial
+# Session -1 — Initial verification
 # ===============================
 session_precheck() {
   if [[ -d /etc/pihole || -d /etc/unbound || -f /usr/local/bin/coredns ]]; then
-    warn "🚨 Detectamos uma instalação existente!"
-    echo "O que deseja fazer?"
-    echo "1) Reinstalar (remove tudo e instala novamente)"
-    echo "2) Atualizar pacotes (mantém configs)"
-    echo "3) Cancelar"
-    read -rp "Escolha [1/2/3]: " CHOICE
+    warn "🚨 Existing installation detected!"
+    echo "What would you like to do?"
+    echo "1) Reinstall (remove everything and fresh install)"
+    echo "2) Update packages (keep configurations)"
+    echo "3) Cancel"
+    read -rp "Choose [1/2/3]: " CHOICE
     case "$CHOICE" in
       1)
-        log "Removendo instalação anterior..."
+        log "Removing previous installation..."
         systemctl stop pihole-FTL unbound coredns doh-proxy 2>/dev/null || true
         apt-get purge -y pihole unbound >/dev/null 2>&1 || true
         rm -rf /etc/pihole /etc/unbound /etc/coredns /opt/coredns /usr/local/bin/coredns
         rm -f /etc/systemd/system/{pihole-FTL.service,coredns.service,doh-proxy.service}
         systemctl daemon-reload
-        log "Instalação anterior removida. Continuando..."
+        log "Previous installation removed. Continuing..."
         ;;
       2)
-        log "Atualizando pacotes..."
+        log "Updating packages..."
         apt-get update -qq && apt-get upgrade -y
-        log "Atualização concluída. Encerrando."
+        log "Update completed. Exiting."
         exit 0
         ;;
-      3|*) log "Abortado."; exit 0 ;;
+      3|*) log "Aborted."; exit 0 ;;
     esac
   fi
 }
 
 # ===============================
-# Sessão 0 — Preparação mínima
+# Session 0 — Minimal preparation
 # ===============================
 session0_prep() {
-  log "Sessão 0: Instalando pacotes mínimos (rede e utilitários)..."
+  log "Session 0: Installing minimal packages (network and utilities)..."
   (apt-get update -qq && apt-get install -y iproute2 net-tools ipcalc curl ca-certificates netcat-traditional >/dev/null) &
   spinner
 }
 
 # ===============================
-# Sessão 1 — Detecção de rede
+# Session 1 — Network detection
 # ===============================
 session1_net() {
-  log "Sessão 1: Detectando rede..."
+  log "Session 1: Detecting network..."
 
   DEF_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1 || true)
   DEF_GW=$(ip -o -4 route show to default | awk '{print $3}' | head -1 || true)
@@ -92,44 +98,44 @@ session1_net() {
   echo
   log "Interface: $DEF_IF"
   log "Gateway:   $DEF_GW"
-  log "IP atual:  $CUR_IP"
-  log "Máscara:   $SUBNET_MASK"
+  log "Current IP: $CUR_IP"
+  log "Subnet Mask: $SUBNET_MASK"
   echo
-  warn "⚠️ Este IP ($CUR_IP) precisa ser FIXO para o ambiente funcionar corretamente."
-  warn "➡️ Configure manualmente o IP fixo no seu host/VM/container antes de prosseguir."
+  warn "⚠️ This IP ($CUR_IP) must be STATIC for the environment to work correctly."
+  warn "➡️ Configure a static IP manually on your host/VM/container before proceeding."
   pause
 }
 
 # ===============================
-# Sessão 2 — Instalação base
+# Session 2 — Base installation
 # ===============================
 session2_base() {
-  log "Sessão 2: Instalando pacotes base (compiladores, libs, Python, Go, etc)..."
+  log "Session 2: Installing base packages (compilers, libs, Python, Go, etc)..."
   (apt-get install -y curl wget git lsof bind9-dnsutils unzip tar golang \
     iproute2 netcat-traditional pipx python3-venv >/dev/null) &
   spinner
 }
 
 # ===============================
-# Sessão 3 — Pi-hole
+# Session 3 — Pi-hole installation
 # ===============================
 session3_pihole() {
-  log "Sessão 3: Instalando Pi-hole..."
+  log "Session 3: Installing Pi-hole..."
   echo
-  warn "⚠️ IMPORTANTE:"
-  echo "Durante a instalação do Pi-hole, escolha:"
+  warn "⚠️ IMPORTANT:"
+  echo "During Pi-hole installation, choose:"
   echo "   → Upstream DNS Providers → 'Custom'"
-  echo "   → Digite: 127.0.0.1#5335"
+  echo "   → Enter: 127.0.0.1#5335"
   echo
   pause
   curl -sSL https://install.pi-hole.net | bash
 }
 
 # ===============================
-# Sessão 4 — Unbound
+# Session 4 — Unbound installation
 # ===============================
 session4_unbound() {
-  log "Sessão 4: Instalando e configurando Unbound..."
+  log "Session 4: Installing and configuring Unbound..."
   (apt-get install -y unbound >/dev/null) &
   spinner
 
@@ -157,15 +163,15 @@ EOF
   mkdir -p /var/lib/unbound
   wget -qO /var/lib/unbound/root.hints https://www.internic.net/domain/named.root || true
   systemctl enable --now unbound
-  log "➡️ Testando Unbound..."
+  log "➡️ Testing Unbound..."
   dig @127.0.0.1 -p 5335 openai.com +short || true
 }
 
 # ===============================
-# Sessão 5 — Pi-hole -> Unbound
+# Session 5 — Pi-hole to Unbound integration
 # ===============================
 session5_pihole_conf() {
-  log "Sessão 5: Ajustando Pi-hole para usar Unbound..."
+  log "Session 5: Configuring Pi-hole to use Unbound..."
   if [[ -f /etc/pihole/setupVars.conf ]]; then
     sed -i '/^PIHOLE_DNS_/d' /etc/pihole/setupVars.conf
     {
@@ -177,10 +183,10 @@ session5_pihole_conf() {
 }
 
 # ===============================
-# Sessão 6 — CoreDNS
+# Session 6 — CoreDNS installation
 # ===============================
 session6_coredns() {
-  log "Sessão 6: Instalando CoreDNS..."
+  log "Session 6: Installing CoreDNS..."
   (cd /opt && \
     curl -fsSL -o coredns.tgz "https://github.com/coredns/coredns/releases/download/v1.11.3/coredns_1.11.3_linux_amd64.tgz" && \
     tar -xzf coredns.tgz && \
@@ -199,7 +205,7 @@ EOF
 
   cat >/etc/systemd/system/coredns.service <<'EOF'
 [Unit]
-Description=CoreDNS (porta 8053)
+Description=CoreDNS (port 8053)
 After=network.target pihole-FTL.service unbound.service
 Requires=pihole-FTL.service unbound.service
 
@@ -217,10 +223,10 @@ EOF
 }
 
 # ===============================
-# Sessão 7 — DoH-proxy
+# Session 7 — DoH-proxy installation
 # ===============================
 session7_doh() {
-  log "Sessão 7: Instalando DoH-proxy..."
+  log "Session 7: Installing DoH-proxy..."
   (pipx install doh-proxy >/dev/null || true) &
   spinner
 
@@ -248,10 +254,10 @@ EOF
 }
 
 # ===============================
-# Sessão 8 — Testes finais
+# Session 8 — Final tests
 # ===============================
 session8_tests() {
-  log "Sessão 8: Testes locais de validação"
+  log "Session 8: Running local validation tests"
   echo "Unbound → "; dig @127.0.0.1 -p 5335 openai.com +short || true
   echo "Pi-hole → "; dig @127.0.0.1 -p 53 openai.com +short || true
   echo "CoreDNS → "; dig @127.0.0.1 -p 8053 openai.com +short || true
@@ -259,70 +265,75 @@ session8_tests() {
 }
 
 # ===============================
-# Sessão 9 — Senha Pi-hole
+# Session 9 — Pi-hole password
 # ===============================
 session9_password() {
-  read -rp "Deseja alterar a senha do painel do Pi-hole agora? [s/N]: " ANS
+  read -rp "Do you want to change the Pi-hole admin password now? [y/N]: " ANS
   ANS=${ANS:-N}
-  if [[ "$ANS" =~ ^[sS]$ ]]; then
-    read -rp "Informe a nova senha: " NEWPASS
+  if [[ "$ANS" =~ ^[yY]$ ]]; then
+    read -rp "Enter new password: " NEWPASS
     pihole setpassword "$NEWPASS"
-    log "Senha do Pi-hole alterada com sucesso."
+    log "Pi-hole password changed successfully."
   else
-    log "Mantida a senha gerada automaticamente pelo Pi-hole."
+    log "Keeping automatically generated Pi-hole password."
   fi
 }
 
 # ===============================
-# Sessão final — Instruções NPM
+# Final session — NPM instructions
 # ===============================
 final_msg() {
   echo
-  log "✅ Instalação concluída!"
+  log "✅ Installation completed!"
   echo "============================================================"
-  echo " IP detectado: $CUR_IP"
+  echo " Detected IP: $CUR_IP"
   echo
-  echo "➡️ Agora configure o Nginx Proxy Manager (NPM):"
+  echo "➡️ Now configure Nginx Proxy Manager (NPM):"
   echo
   echo "1) DoH (DNS-over-HTTPS)"
-  echo "   - Vá em Proxy Hosts → Add Proxy Host"
-  echo "   - Domain Names: SEU_DOMINIO (ex.: dns.seusite.com)"
+  echo "   - Go to Proxy Hosts → Add Proxy Host"
+  echo "   - Domain Names: YOUR_DOMAIN (e.g.: dns.yoursite.com)"
   echo "   - Scheme: http"
   echo "   - Forward Host/IP: $CUR_IP"
   echo "   - Forward Port: 8054"
   echo "   - Path: /dns-query"
-  echo "   - SSL: Ative e selecione o certificado Let's Encrypt"
+  echo "   - SSL: Enable and select Let's Encrypt certificate"
   echo "   - Force SSL: ON"
   echo
   echo "2) DoT (DNS-over-TLS)"
-  echo "   - Vá em Streams → Add Stream"
+  echo "   - Go to Streams → Add Stream"
   echo "   - Incoming port: 853"
   echo "   - Forward Host: $CUR_IP"
   echo "   - Forward Port: 8053"
-  echo "   - SSL Certificate: selecione o mesmo domínio"
+  echo "   - SSL Certificate: select same domain"
   echo
-  echo "3) Testes externos:"
-  echo "   - DoH: kdig @dns.seusite.com +https=/dns-query openai.com"
-  echo "   - DoT: kdig @dns.seusite.com -p 853 +tls +tls-hostname=dns.seusite.com openai.com"
+  echo "3) External tests:"
+  echo "   - DoH: kdig @dns.yoursite.com +https=/dns-query openai.com"
+  echo "   - DoT: kdig @dns.yoursite.com -p 853 +tls +tls-hostname=dns.yoursite.com openai.com"
   echo
-  echo "💡 Em celulares Android/iOS → configure DNS privado com seu domínio (DoT)."
-  echo "💡 Em navegadores/Apps → configure https://dns.seusite.com/dns-query como DoH."
+  echo "💡 On Android/iOS phones → configure private DNS with your domain (DoT)."
+  echo "💡 In browsers/Apps → configure https://dns.yoursite.com/dns-query as DoH."
   echo "============================================================"
 }
 
 # ===============================
-# Main
+# Main execution
 # ===============================
-need_root
-session_precheck
-session0_prep
-session1_net
-session2_base
-session3_pihole
-session4_unbound
-session5_pihole_conf
-session6_coredns
-session7_doh
-session8_tests
-session9_password
-final_msg
+main() {
+  need_root
+  session_precheck
+  session0_prep
+  session1_net
+  session2_base
+  session3_pihole
+  session4_unbound
+  session5_pihole_conf
+  session6_coredns
+  session7_doh
+  session8_tests
+  session9_password
+  final_msg
+}
+
+# Run main function
+main "$@"
